@@ -37,6 +37,8 @@ Global Const $FOLLOWER_INFORMATIONS = 'This bot makes your character follow the 
 	& 'It will loot all items it can loot.' & @CRLF _
 	& 'It will also loot all chests in range.'
 
+Global Const $FOLLOWER_LEASH_RANGE = 850
+
 ; Skill numbers declared to make the code WAY more readable (UseSkillEx($RAPTORS_MARK_OF_PAIN) is better than UseSkillEx(1))
 Global $player_profession_ID
 Global $follower_attack_skill_1 = Null
@@ -132,31 +134,64 @@ EndFunc
 
 ;~ Follower loop
 Func FollowerLoop($runFunction = DefaultRun, $fightFunction = DefaultFight)
-	If GetMapType() <> $ID_EXPLORABLE Then
-		Sleep(3000)
-		Return
+	Local Static $firstPlayer = Null, $currentMap = Null, $resignedThisMap = False
+
+	SkipCinematic()
+
+	Local $mapID = GetMapID()
+	If $mapID <> $currentMap Then
+		$currentMap = $mapID
+		$firstPlayer = Null
+		$resignedThisMap = False
+		WaitMapLoading($mapID)
 	EndIf
 
-	Local Static $firstPlayer = Null, $currentMap = Null
-	; Whenever player travels to a new explorable location, then current map ID is saved and first player agent is refreshed, because changing location can change agent ID of player
-	If GetMapID() <> $currentMap Then
-		$firstPlayer = GetFirstPlayerOfParty()
-		$currentMap = GetMapID()
+	If $firstPlayer == Null Then
+		$firstPlayer = FollowerResolveLeader()
+		If $firstPlayer == Null Then
+			RandomSleep(500)
+			Return
+		EndIf
 	EndIf
+
 	$runFunction()
 	GoPlayer($firstPlayer)
-	Local $foesCount = CountFoesInRangeOfAgent(GetMyAgent(), $RANGE_EARSHOT)
-	If $foesCount > 0 Then
-		Debug('Foes in range detected, starting fight')
-		While IsPlayerAlive() And $foesCount > 0
-			$fightFunction()
-			$foesCount = CountFoesInRangeOfAgent(GetMyAgent(), $RANGE_EARSHOT)
-		WEnd
-		Debug('Fight is over')
-	EndIf
-	FindAndOpenChests()
 
-	If CountSlots(1, $bags_count) > 0 Then PickUpItems(Null, DefaultShouldPickItem, 1500)
+	If GetMapType() == $ID_EXPLORABLE Then
+		If Not $resignedThisMap Then
+			Info('Auto-resigning on explorable entry')
+			Resign()
+			$resignedThisMap = True
+			RandomSleep(500)
+		EndIf
+
+		Local $leaderID = DllStructGetData($firstPlayer, 'ID')
+		Local $me = GetMyAgent()
+		Local $leaderClose = False
+		If GetAgentExists($leaderID) Then
+			$leaderClose = (GetDistance($me, GetAgentByID($leaderID)) <= $FOLLOWER_LEASH_RANGE)
+		EndIf
+
+		If $leaderClose Then
+			Local $foesCount = CountFoesInRangeOfAgent($me, $RANGE_EARSHOT)
+			If $foesCount > 0 Then
+				Debug('Foes in range detected, starting fight')
+				While IsPlayerAlive() And $foesCount > 0
+					$fightFunction()
+					$me = GetMyAgent()
+					If GetAgentExists($leaderID) And GetDistance($me, GetAgentByID($leaderID)) > $FOLLOWER_LEASH_RANGE Then
+						Debug('Leader leaving earshot, breaking combat to follow')
+						ExitLoop
+					EndIf
+					$foesCount = CountFoesInRangeOfAgent($me, $RANGE_EARSHOT)
+				WEnd
+				Debug('Fight is over')
+			EndIf
+			FindAndOpenChests()
+
+			If CountSlots(1, $bags_count) > 0 Then PickUpItems(Null, DefaultShouldPickItem, 1500)
+		EndIf
+	EndIf
 
 	RandomSleep(1000)
 EndFunc
@@ -318,18 +353,60 @@ Func ParagonFight()
 EndFunc
 
 
+;~ Resolve the leader's agent struct by reading the agent ID directly out of the player record array.
+;~ Works in both outposts and explorables. Bypasses the lib's GetFirstPlayerOfParty, which fails in
+;~ outposts because party agent structs report LoginNumber=0 there.
+;~ Player records are 80 bytes wide; agent ID is at offset 0 of each record.
+Func FollowerResolveLeader()
+	Local $processHandle = GetProcessHandle()
+	Local $selfLoginNumber = DllStructGetData(GetMyAgent(), 'LoginNumber')
+
+	Local $countOffset[] = [0, 0x18, 0x4C, 0x54, 0xC]
+	Local $playerCount = MemoryReadPtr($processHandle, $base_address_ptr, $countOffset)[1]
+
+	For $i = 0 To $playerCount - 1
+		Local $slotOffset[] = [0, 0x18, 0x4C, 0x54, 0x4, 4 * $i]
+		Local $slotLogin = MemoryReadPtr($processHandle, $base_address_ptr, $slotOffset)[1]
+
+		If $slotLogin == 0 Then ContinueLoop
+		If $slotLogin == $selfLoginNumber Then ContinueLoop
+
+		Local $agentIDOffset[] = [0, 0x18, 0x2C, 0x80C, 80 * $slotLogin]
+		Local $leaderAgentID = MemoryReadPtr($processHandle, $base_address_ptr, $agentIDOffset)[1]
+
+		If $leaderAgentID == 0 Then ContinueLoop
+		If Not GetAgentExists($leaderAgentID) Then ContinueLoop
+
+		Return GetAgentByID($leaderAgentID)
+	Next
+
+	Return Null
+EndFunc
+
+
 ;~ Get first player of the party team other than yourself. If no other player found in the party team then function returns Null
 Func GetFirstPlayerOfParty()
-	Local $party = GetParty()
-	Local $ownID = DllStructGetData(GetMyAgent(), 'ID')
-	Local $firstPlayer = Null
-	For $member In $party
-		If DllStructGetData($member, 'ID') == $ownID Then ContinueLoop
-		Local $heroNumber = GetHeroNumberByAgentID(DllStructGetData($member, 'ID'))
-		If $heroNumber == Null Then
-			$firstPlayer = $member
-			Return $firstPlayer
-		EndIf
-	Next
-	Return Null
+    Local $processHandle = GetProcessHandle()
+    Local $selfLoginNumber = DllStructGetData(GetMyAgent(), 'LoginNumber')
+
+    Local $countOffset[] = [0, 0x18, 0x4C, 0x54, 0xC]
+    Local $playerCount = MemoryReadPtr($processHandle, $base_address_ptr, $countOffset)[1]
+
+    Local $party = GetParty()
+
+    For $i = 0 To $playerCount - 1
+        Local $slotOffset[] = [0, 0x18, 0x4C, 0x54, 0x4, 4 * $i]
+        Local $slotLoginNumber = MemoryReadPtr($processHandle, $base_address_ptr, $slotOffset)[1]
+
+        If $slotLoginNumber == 0 Then ContinueLoop
+        If $slotLoginNumber == $selfLoginNumber Then ContinueLoop
+
+        For $member In $party
+            If DllStructGetData($member, 'LoginNumber') == $slotLoginNumber Then
+                Return $member
+            EndIf
+        Next
+    Next
+
+    Return Null
 EndFunc
